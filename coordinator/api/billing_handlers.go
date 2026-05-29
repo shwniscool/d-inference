@@ -133,6 +133,16 @@ func (s *Server) handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// setup_intent.succeeded fires when a user finishes saving a card for auto
+	// top-up. Persist the resulting payment method as their default so we can
+	// charge it off-session. This is a defensive backstop to the synchronous
+	// /v1/billing/auto-topup/confirm path (issue #231).
+	if event.Type == "setup_intent.succeeded" {
+		s.handleSetupIntentSucceeded(event)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if event.Type != "checkout.session.completed" {
 		w.WriteHeader(http.StatusOK)
 		return

@@ -998,6 +998,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		s.ddHistogram("billing.reserved_micro_usd", float64(reservedMicroUSD), []string{"model:" + model})
 		s.ddHistogram("store.debit.latency_ms", float64(time.Since(start).Milliseconds()), []string{"op:reserve"})
+
+		// The reservation just lowered the balance. Kick off a best-effort
+		// auto top-up check off the hot path so a low balance is replenished
+		// before the next request hits a 402. Never blocks or fails this
+		// request (issue #231).
+		if at := s.billing.AutoTopup(); at != nil && at.Available() {
+			go at.MaybeAutoTopup(consumerKey)
+		}
 	}
 	timing.ReservedAt = time.Now()
 

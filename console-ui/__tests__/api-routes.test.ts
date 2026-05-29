@@ -230,6 +230,120 @@ describe("POST /api/payments/stripe/checkout", () => {
 });
 
 // =========================================================================
+// /api/payments/auto-topup
+// =========================================================================
+
+describe("/api/payments/auto-topup", () => {
+  it("GET proxies auth to coordinator /v1/billing/auto-topup", async () => {
+    upstreamFetch.mockResolvedValueOnce(
+      upstreamOk({ enabled: false, has_saved_card: false })
+    );
+
+    const { GET } = await import("@/app/api/payments/auto-topup/route");
+    const req = makeRequest("/api/payments/auto-topup", {
+      headers: { authorization: "Bearer privy-token-123" },
+    });
+    const res = await GET(req);
+
+    expect(res.status).toBe(200);
+    const [upstreamUrl, upstreamOpts] = upstreamFetch.mock.calls[0];
+    expect(upstreamUrl).toBe(`${DEFAULT_COORD}/v1/billing/auto-topup`);
+    expect(upstreamOpts.headers.Authorization).toBe("Bearer privy-token-123");
+  });
+
+  it("PUT forwards body and auth to coordinator /v1/billing/auto-topup", async () => {
+    upstreamFetch.mockResolvedValueOnce(
+      upstreamOk({ enabled: true, has_saved_card: true })
+    );
+
+    const { PUT } = await import("@/app/api/payments/auto-topup/route");
+    const req = makeRequest("/api/payments/auto-topup", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        authorization: "Bearer privy-token-123",
+      },
+      body: JSON.stringify({
+        enabled: true,
+        payment_method: "stripe",
+        threshold_micro_usd: 5_000_000,
+        amount_micro_usd: 10_000_000,
+      }),
+    });
+    const res = await PUT(req);
+
+    expect(res.status).toBe(200);
+    const [upstreamUrl, upstreamOpts] = upstreamFetch.mock.calls[0];
+    expect(upstreamUrl).toBe(`${DEFAULT_COORD}/v1/billing/auto-topup`);
+    expect(upstreamOpts.method).toBe("PUT");
+    expect(upstreamOpts.headers.Authorization).toBe("Bearer privy-token-123");
+    expect(JSON.parse(upstreamOpts.body)).toEqual({
+      enabled: true,
+      payment_method: "stripe",
+      threshold_micro_usd: 5_000_000,
+      amount_micro_usd: 10_000_000,
+    });
+  });
+
+  it("PUT passes through upstream validation errors", async () => {
+    upstreamFetch.mockResolvedValueOnce(
+      upstreamError(400, JSON.stringify({ error: { type: "no_card", message: "no saved card" } }))
+    );
+
+    const { PUT } = await import("@/app/api/payments/auto-topup/route");
+    const req = makeRequest("/api/payments/auto-topup", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: true, payment_method: "stripe" }),
+    });
+    const res = await PUT(req);
+
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain("no saved card");
+  });
+
+  it("setup-intent POSTs to coordinator /v1/billing/auto-topup/setup-intent", async () => {
+    upstreamFetch.mockResolvedValueOnce(
+      upstreamOk({ setup_intent_id: "seti_1", client_secret: "seti_1_secret", customer_id: "cus_1" })
+    );
+
+    const { POST } = await import("@/app/api/payments/auto-topup/setup-intent/route");
+    const req = makeRequest("/api/payments/auto-topup/setup-intent", {
+      method: "POST",
+      headers: { authorization: "Bearer privy-token-123" },
+    });
+    const res = await POST(req);
+
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.client_secret).toBe("seti_1_secret");
+    const [upstreamUrl, upstreamOpts] = upstreamFetch.mock.calls[0];
+    expect(upstreamUrl).toBe(`${DEFAULT_COORD}/v1/billing/auto-topup/setup-intent`);
+    expect(upstreamOpts.method).toBe("POST");
+  });
+
+  it("confirm forwards setup_intent_id to coordinator /v1/billing/auto-topup/confirm", async () => {
+    upstreamFetch.mockResolvedValueOnce(
+      upstreamOk({ enabled: false, has_saved_card: true })
+    );
+
+    const { POST } = await import("@/app/api/payments/auto-topup/confirm/route");
+    const req = makeRequest("/api/payments/auto-topup/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", authorization: "Bearer privy-token-123" },
+      body: JSON.stringify({ setup_intent_id: "seti_1" }),
+    });
+    const res = await POST(req);
+
+    expect(res.status).toBe(200);
+    const [upstreamUrl, upstreamOpts] = upstreamFetch.mock.calls[0];
+    expect(upstreamUrl).toBe(`${DEFAULT_COORD}/v1/billing/auto-topup/confirm`);
+    expect(JSON.parse(upstreamOpts.body)).toEqual({ setup_intent_id: "seti_1" });
+  });
+});
+
+// =========================================================================
 // GET /api/payments/usage
 // =========================================================================
 

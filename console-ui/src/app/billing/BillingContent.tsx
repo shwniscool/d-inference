@@ -36,6 +36,7 @@ import {
 } from "lucide-react";
 import { UsageChart } from "@/components/UsageChart";
 import { STRIPE_CONNECT_COUNTRIES } from "@/lib/stripe-countries";
+import { AutoTopUpCard } from "./AutoTopUpCard";
 
 function Modal({
   open,
@@ -328,6 +329,9 @@ export default function BillingContent() {
               </div>
             )}
           </div>
+
+          {/* Auto Top-Up (Stripe saved card) */}
+          <AutoTopUpCard />
 
           {/* Withdraw to Bank (Stripe Connect Express) */}
           <StripePayoutsCard

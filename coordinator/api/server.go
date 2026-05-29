@@ -1198,6 +1198,14 @@ func (s *Server) routes() {
 	// Wallet balance
 	s.mux.HandleFunc("GET /v1/billing/wallet/balance", s.requireAuth(s.handleWalletBalance))
 
+	// Auto top-up — automatic balance replenishment via saved Stripe card.
+	// Config read is unthrottled; mutations + the card-setup flow hit external
+	// Stripe APIs so they get the financial limiter.
+	s.mux.HandleFunc("GET /v1/billing/auto-topup", s.requireAuth(s.handleGetAutoTopup))
+	s.mux.HandleFunc("PUT /v1/billing/auto-topup", s.requireAuth(s.rateLimitFinancial(s.handleSetAutoTopup)))
+	s.mux.HandleFunc("POST /v1/billing/auto-topup/setup-intent", s.requireAuth(s.rateLimitFinancial(s.handleAutoTopupSetupIntent)))
+	s.mux.HandleFunc("POST /v1/billing/auto-topup/confirm", s.requireAuth(s.rateLimitFinancial(s.handleAutoTopupConfirm)))
+
 	// Stripe Payouts (Connect Express) — bank/card withdrawals.
 	s.mux.HandleFunc("POST /v1/billing/stripe/onboard", s.requireAuth(s.handleStripeOnboard))
 	s.mux.HandleFunc("GET /v1/billing/stripe/status", s.requireAuth(s.handleStripeStatus))

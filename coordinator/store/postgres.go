@@ -301,6 +301,54 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		END $$`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_privy ON users(privy_user_id)`,
 
+		// Inbound Stripe customer + saved card (for auto top-up off-session
+		// charges). Distinct from the Connect payout account above.
+		`DO $$ BEGIN
+			ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT NOT NULL DEFAULT '';
+		EXCEPTION WHEN others THEN NULL;
+		END $$`,
+		`DO $$ BEGIN
+			ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_default_payment_method_id TEXT NOT NULL DEFAULT '';
+		EXCEPTION WHEN others THEN NULL;
+		END $$`,
+		`DO $$ BEGIN
+			ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_payment_method_brand TEXT NOT NULL DEFAULT '';
+		EXCEPTION WHEN others THEN NULL;
+		END $$`,
+		`DO $$ BEGIN
+			ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_payment_method_last4 TEXT NOT NULL DEFAULT '';
+		EXCEPTION WHEN others THEN NULL;
+		END $$`,
+		`CREATE INDEX IF NOT EXISTS idx_users_stripe_customer ON users(stripe_customer_id) WHERE stripe_customer_id <> ''`,
+
+		// Auto top-up — per-account replenishment preferences.
+		`CREATE TABLE IF NOT EXISTS auto_topup_config (
+			account_id TEXT PRIMARY KEY,
+			enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			threshold_micro_usd BIGINT NOT NULL DEFAULT 0,
+			amount_micro_usd BIGINT NOT NULL DEFAULT 0,
+			payment_method TEXT NOT NULL DEFAULT 'stripe',
+			max_per_24h_micro_usd BIGINT NOT NULL DEFAULT 0,
+			max_single_micro_usd BIGINT NOT NULL DEFAULT 0,
+			cooldown_seconds BIGINT NOT NULL DEFAULT 0,
+			notify_webhook_url TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+
+		// Auto top-up attempts — source of truth for the rolling 24h cap and
+		// cooldown gate. Written before the Stripe charge, updated with the
+		// terminal status.
+		`CREATE TABLE IF NOT EXISTS auto_topup_events (
+			id BIGSERIAL PRIMARY KEY,
+			account_id TEXT NOT NULL,
+			amount_micro_usd BIGINT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			external_id TEXT NOT NULL DEFAULT '',
+			failure_reason TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_auto_topup_events_account ON auto_topup_events(account_id, created_at DESC)`,
+
 		// Supported models — admin-managed catalog
 		`CREATE TABLE IF NOT EXISTS supported_models (
 			id TEXT PRIMARY KEY,
@@ -1810,7 +1858,9 @@ func (s *PostgresStore) CreateUser(user *User) error {
 
 const userSelectColumns = `account_id, privy_user_id, email, role, platform_fee_percent,
 	stripe_account_id, stripe_account_status, stripe_destination_type,
-	stripe_destination_last4, stripe_instant_eligible, created_at`
+	stripe_destination_last4, stripe_instant_eligible,
+	stripe_customer_id, stripe_default_payment_method_id,
+	stripe_payment_method_brand, stripe_payment_method_last4, created_at`
 
 func scanUser(row interface {
 	Scan(...any) error
@@ -1818,7 +1868,9 @@ func scanUser(row interface {
 	var u User
 	if err := row.Scan(&u.AccountID, &u.PrivyUserID, &u.Email, &u.Role, &u.PlatformFeePercent,
 		&u.StripeAccountID, &u.StripeAccountStatus, &u.StripeDestinationType,
-		&u.StripeDestinationLast4, &u.StripeInstantEligible, &u.CreatedAt); err != nil {
+		&u.StripeDestinationLast4, &u.StripeInstantEligible,
+		&u.StripeCustomerID, &u.StripeDefaultPaymentMethodID,
+		&u.StripePaymentMethodBrand, &u.StripePaymentMethodLast4, &u.CreatedAt); err != nil {
 		return nil, err
 	}
 	return &u, nil
@@ -1891,6 +1943,169 @@ func (s *PostgresStore) GetUserByStripeAccount(stripeAccountID string) (*User, e
 		return nil, fmt.Errorf("store: user with Stripe account %q not found: %w", stripeAccountID, err)
 	}
 	return u, nil
+}
+
+// SetUserStripeCustomer upserts the inbound Stripe customer + saved-card fields.
+func (s *PostgresStore) SetUserStripeCustomer(accountID, customerID, paymentMethodID, brand, last4 string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE users SET
+			stripe_customer_id = $2,
+			stripe_default_payment_method_id = $3,
+			stripe_payment_method_brand = $4,
+			stripe_payment_method_last4 = $5
+		 WHERE account_id = $1`,
+		accountID, customerID, paymentMethodID, brand, last4,
+	)
+	if err != nil {
+		return fmt.Errorf("store: set stripe customer: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("user with account ID %q not found", accountID)
+	}
+	return nil
+}
+
+// GetUserByStripeCustomer finds a user by their inbound Stripe customer ID.
+func (s *PostgresStore) GetUserByStripeCustomer(customerID string) (*User, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	row := s.pool.QueryRow(ctx,
+		`SELECT `+userSelectColumns+` FROM users WHERE stripe_customer_id = $1`, customerID,
+	)
+	u, err := scanUser(row)
+	if err != nil {
+		return nil, fmt.Errorf("store: user with Stripe customer %q not found: %w", customerID, err)
+	}
+	return u, nil
+}
+
+// GetAutoTopupConfig returns the auto top-up config for an account, or
+// (nil, nil) when none has been configured.
+func (s *PostgresStore) GetAutoTopupConfig(accountID string) (*AutoTopupConfig, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var c AutoTopupConfig
+	err := s.pool.QueryRow(ctx,
+		`SELECT account_id, enabled, threshold_micro_usd, amount_micro_usd, payment_method,
+			max_per_24h_micro_usd, max_single_micro_usd, cooldown_seconds, notify_webhook_url, updated_at
+		 FROM auto_topup_config WHERE account_id = $1`, accountID,
+	).Scan(&c.AccountID, &c.Enabled, &c.ThresholdMicroUSD, &c.AmountMicroUSD, &c.PaymentMethod,
+		&c.MaxPer24hMicroUSD, &c.MaxSingleMicroUSD, &c.CooldownSeconds, &c.NotifyWebhookURL, &c.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: get auto top-up config: %w", err)
+	}
+	return &c, nil
+}
+
+// SetAutoTopupConfig upserts an account's auto top-up configuration.
+func (s *PostgresStore) SetAutoTopupConfig(cfg *AutoTopupConfig) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO auto_topup_config
+			(account_id, enabled, threshold_micro_usd, amount_micro_usd, payment_method,
+			 max_per_24h_micro_usd, max_single_micro_usd, cooldown_seconds, notify_webhook_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+		 ON CONFLICT (account_id) DO UPDATE SET
+			enabled = EXCLUDED.enabled,
+			threshold_micro_usd = EXCLUDED.threshold_micro_usd,
+			amount_micro_usd = EXCLUDED.amount_micro_usd,
+			payment_method = EXCLUDED.payment_method,
+			max_per_24h_micro_usd = EXCLUDED.max_per_24h_micro_usd,
+			max_single_micro_usd = EXCLUDED.max_single_micro_usd,
+			cooldown_seconds = EXCLUDED.cooldown_seconds,
+			notify_webhook_url = EXCLUDED.notify_webhook_url,
+			updated_at = NOW()`,
+		cfg.AccountID, cfg.Enabled, cfg.ThresholdMicroUSD, cfg.AmountMicroUSD, cfg.PaymentMethod,
+		cfg.MaxPer24hMicroUSD, cfg.MaxSingleMicroUSD, cfg.CooldownSeconds, cfg.NotifyWebhookURL,
+	)
+	if err != nil {
+		return fmt.Errorf("store: set auto top-up config: %w", err)
+	}
+	return nil
+}
+
+// RecordAutoTopupEvent inserts a new auto top-up attempt and returns its ID.
+func (s *PostgresStore) RecordAutoTopupEvent(ev *AutoTopupEvent) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	status := ev.Status
+	if status == "" {
+		status = AutoTopupPending
+	}
+	var id int64
+	err := s.pool.QueryRow(ctx,
+		`INSERT INTO auto_topup_events (account_id, amount_micro_usd, status, external_id, failure_reason)
+		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		ev.AccountID, ev.AmountMicroUSD, status, ev.ExternalID, ev.FailureReason,
+	).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("store: record auto top-up event: %w", err)
+	}
+	return id, nil
+}
+
+// UpdateAutoTopupEvent updates the terminal status of an attempt.
+func (s *PostgresStore) UpdateAutoTopupEvent(id int64, status, externalID, failureReason string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := s.pool.Exec(ctx,
+		`UPDATE auto_topup_events SET status = $2, external_id = $3, failure_reason = $4 WHERE id = $1`,
+		id, status, externalID, failureReason,
+	)
+	if err != nil {
+		return fmt.Errorf("store: update auto top-up event: %w", err)
+	}
+	return nil
+}
+
+// AutoTopupChargedSince sums non-failed auto top-up amounts since the given
+// time (pending + succeeded count toward the cap so a stuck charge can't be
+// used to exceed it).
+func (s *PostgresStore) AutoTopupChargedSince(accountID string, since time.Time) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var sum int64
+	err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(amount_micro_usd), 0) FROM auto_topup_events
+		 WHERE account_id = $1 AND created_at >= $2 AND status <> $3`,
+		accountID, since, AutoTopupFailed,
+	).Scan(&sum)
+	if err != nil {
+		return 0, fmt.Errorf("store: sum auto top-ups: %w", err)
+	}
+	return sum, nil
+}
+
+// LastAutoTopupEvent returns the most recent attempt for an account.
+func (s *PostgresStore) LastAutoTopupEvent(accountID string) (*AutoTopupEvent, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var e AutoTopupEvent
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, account_id, amount_micro_usd, status, external_id, failure_reason, created_at
+		 FROM auto_topup_events WHERE account_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1`, accountID,
+	).Scan(&e.ID, &e.AccountID, &e.AmountMicroUSD, &e.Status, &e.ExternalID, &e.FailureReason, &e.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: last auto top-up event: %w", err)
+	}
+	return &e, nil
 }
 
 // SetUserRole sets the account role on a user record.

@@ -252,6 +252,39 @@ type Store interface {
 	// Used by webhook handlers to route account.updated / payout.* events.
 	GetUserByStripeAccount(stripeAccountID string) (*User, error)
 
+	// SetUserStripeCustomer upserts the inbound Stripe customer + saved-card
+	// fields on a user record (distinct from the Connect payout account). Pass
+	// empty pmID/brand/last4 to record the customer before a card is attached.
+	SetUserStripeCustomer(accountID, customerID, paymentMethodID, brand, last4 string) error
+
+	// GetUserByStripeCustomer finds a user by their inbound Stripe customer ID.
+	// Used by webhook handlers to route setup_intent / payment_intent events.
+	GetUserByStripeCustomer(customerID string) (*User, error)
+
+	// --- Auto top-up ---
+
+	// GetAutoTopupConfig returns the auto top-up configuration for an account.
+	// Returns (nil, nil) when the account has never configured auto top-up.
+	GetAutoTopupConfig(accountID string) (*AutoTopupConfig, error)
+
+	// SetAutoTopupConfig upserts an account's auto top-up configuration.
+	SetAutoTopupConfig(cfg *AutoTopupConfig) error
+
+	// RecordAutoTopupEvent inserts a new auto top-up attempt and returns its ID.
+	RecordAutoTopupEvent(ev *AutoTopupEvent) (int64, error)
+
+	// UpdateAutoTopupEvent updates the terminal status of an attempt.
+	UpdateAutoTopupEvent(id int64, status string, externalID, failureReason string) error
+
+	// AutoTopupChargedSince returns the sum of micro-USD across succeeded (and
+	// in-flight pending) auto top-ups for an account since the given time.
+	// Used to enforce the rolling 24h cap.
+	AutoTopupChargedSince(accountID string, since time.Time) (int64, error)
+
+	// LastAutoTopupEvent returns the most recent auto top-up attempt for an
+	// account, or (nil, nil) if there are none. Used to enforce the cooldown.
+	LastAutoTopupEvent(accountID string) (*AutoTopupEvent, error)
+
 	// SetUserRole sets the account role (e.g. "" or RoleService). Used by the
 	// admin API to grant a partner account elevated rate limits.
 	SetUserRole(accountID, role string) error
@@ -554,6 +587,7 @@ const (
 	LedgerRefund         LedgerEntryType = "refund"          // reservation refund (request failed before inference)
 	LedgerAdminCredit    LedgerEntryType = "admin_credit"    // admin-granted non-withdrawable credit
 	LedgerAdminReward    LedgerEntryType = "admin_reward"    // admin-granted withdrawable reward
+	LedgerAutoTopup      LedgerEntryType = "auto_topup"      // automatic Stripe off-session replenishment
 )
 
 // LedgerEntry is a single balance-changing event.
@@ -565,6 +599,41 @@ type LedgerEntry struct {
 	BalanceAfter   int64           `json:"balance_after"`
 	Reference      string          `json:"reference"` // job ID, tx hash, etc.
 	CreatedAt      time.Time       `json:"created_at"`
+}
+
+// AutoTopupConfig holds an account's automatic-replenishment preferences.
+// All money fields are micro-USD (1e6 = $1) to match the ledger.
+type AutoTopupConfig struct {
+	AccountID         string    `json:"account_id"`
+	Enabled           bool      `json:"enabled"`
+	ThresholdMicroUSD int64     `json:"threshold_micro_usd"`   // top up when balance drops below this
+	AmountMicroUSD    int64     `json:"amount_micro_usd"`      // how much to add per top-up
+	PaymentMethod     string    `json:"payment_method"`        // "stripe" (only supported rail)
+	MaxPer24hMicroUSD int64     `json:"max_per_24h_micro_usd"` // rolling 24h cap (safety rail)
+	MaxSingleMicroUSD int64     `json:"max_single_micro_usd"`  // per-charge cap (safety rail)
+	CooldownSeconds   int64     `json:"cooldown_seconds"`      // minimum gap between top-ups
+	NotifyWebhookURL  string    `json:"notify_webhook_url,omitempty"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+// AutoTopupEventStatus enumerates the lifecycle of an auto top-up attempt.
+const (
+	AutoTopupPending   = "pending"   // charge initiated against Stripe
+	AutoTopupSucceeded = "succeeded" // Stripe charge confirmed, balance credited
+	AutoTopupFailed    = "failed"    // charge declined or errored
+)
+
+// AutoTopupEvent records a single automatic-replenishment attempt. The table
+// is the source of truth for the rolling 24h cap and the cooldown gate, so it
+// is written before the Stripe charge and updated with the terminal status.
+type AutoTopupEvent struct {
+	ID             int64     `json:"id"`
+	AccountID      string    `json:"account_id"`
+	AmountMicroUSD int64     `json:"amount_micro_usd"`
+	Status         string    `json:"status"`                // AutoTopup* above
+	ExternalID     string    `json:"external_id,omitempty"` // Stripe PaymentIntent ID
+	FailureReason  string    `json:"failure_reason,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // PaymentRecord captures a settled payment.
@@ -638,6 +707,16 @@ type User struct {
 	StripeDestinationType  string `json:"stripe_destination_type,omitempty"` // "bank" | "card" | ""
 	StripeDestinationLast4 string `json:"stripe_destination_last4,omitempty"`
 	StripeInstantEligible  bool   `json:"stripe_instant_eligible,omitempty"` // debit-card destination supports Instant Payouts
+
+	// Stripe Customer — the inbound (deposit) side, distinct from the Connect
+	// account above. Created the first time a user sets up auto top-up so we
+	// can charge their saved card off-session. StripeDefaultPaymentMethodID is
+	// the saved card (pm_...) attached via a SetupIntent; Brand/Last4 are
+	// display hints surfaced in the billing UI.
+	StripeCustomerID             string `json:"stripe_customer_id,omitempty"`
+	StripeDefaultPaymentMethodID string `json:"stripe_default_payment_method_id,omitempty"`
+	StripePaymentMethodBrand     string `json:"stripe_payment_method_brand,omitempty"` // "visa", "mastercard", ...
+	StripePaymentMethodLast4     string `json:"stripe_payment_method_last4,omitempty"`
 }
 
 // StripeWithdrawal records a user-initiated payout via Stripe Connect Express.

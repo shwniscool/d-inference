@@ -67,6 +67,12 @@ type MemoryStore struct {
 	usersByPrivyID         map[string]*User // privyUserID → user
 	usersByAccountID       map[string]*User // accountID → user
 	usersByStripeAccountID map[string]*User // stripeAccountID → user (subset of usersByAccountID)
+	usersByStripeCustomer  map[string]*User // stripeCustomerID → user (subset of usersByAccountID)
+
+	// Auto top-up
+	autoTopupConfig  map[string]*AutoTopupConfig  // accountID → config
+	autoTopupEvents  map[string][]*AutoTopupEvent // accountID → events, newest last
+	autoTopupEventID int64                        // auto-increment ID
 
 	// Stripe Connect withdrawals
 	stripeWithdrawalsByID         map[string]*StripeWithdrawal
@@ -134,6 +140,9 @@ func NewMemory(scfg Config) *MemoryStore {
 		usersByPrivyID:                make(map[string]*User),
 		usersByAccountID:              make(map[string]*User),
 		usersByStripeAccountID:        make(map[string]*User),
+		usersByStripeCustomer:         make(map[string]*User),
+		autoTopupConfig:               make(map[string]*AutoTopupConfig),
+		autoTopupEvents:               make(map[string][]*AutoTopupEvent),
 		stripeWithdrawalsByID:         make(map[string]*StripeWithdrawal),
 		stripeWithdrawalsByTransferID: make(map[string]string),
 		stripeWithdrawalsByPayoutID:   make(map[string]string),
@@ -1457,6 +1466,132 @@ func (s *MemoryStore) GetUserByStripeAccount(stripeAccountID string) (*User, err
 		return nil, fmt.Errorf("user with Stripe account %q not found", stripeAccountID)
 	}
 	copy := *u
+	return &copy, nil
+}
+
+// SetUserStripeCustomer upserts the inbound Stripe customer + saved-card fields.
+func (s *MemoryStore) SetUserStripeCustomer(accountID, customerID, paymentMethodID, brand, last4 string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	u, ok := s.usersByAccountID[accountID]
+	if !ok {
+		return fmt.Errorf("user with account ID %q not found", accountID)
+	}
+
+	if u.StripeCustomerID != "" && u.StripeCustomerID != customerID {
+		delete(s.usersByStripeCustomer, u.StripeCustomerID)
+	}
+
+	u.StripeCustomerID = customerID
+	u.StripeDefaultPaymentMethodID = paymentMethodID
+	u.StripePaymentMethodBrand = brand
+	u.StripePaymentMethodLast4 = last4
+
+	if customerID != "" {
+		s.usersByStripeCustomer[customerID] = u
+	}
+	return nil
+}
+
+// GetUserByStripeCustomer finds a user by their inbound Stripe customer ID.
+func (s *MemoryStore) GetUserByStripeCustomer(customerID string) (*User, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	u, ok := s.usersByStripeCustomer[customerID]
+	if !ok {
+		return nil, fmt.Errorf("user with Stripe customer %q not found", customerID)
+	}
+	copy := *u
+	return &copy, nil
+}
+
+// GetAutoTopupConfig returns the auto top-up config for an account, or
+// (nil, nil) when none has been configured.
+func (s *MemoryStore) GetAutoTopupConfig(accountID string) (*AutoTopupConfig, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	c, ok := s.autoTopupConfig[accountID]
+	if !ok {
+		return nil, nil
+	}
+	copy := *c
+	return &copy, nil
+}
+
+// SetAutoTopupConfig upserts an account's auto top-up configuration.
+func (s *MemoryStore) SetAutoTopupConfig(cfg *AutoTopupConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	stored := *cfg
+	stored.UpdatedAt = time.Now()
+	s.autoTopupConfig[cfg.AccountID] = &stored
+	return nil
+}
+
+// RecordAutoTopupEvent inserts a new auto top-up attempt and returns its ID.
+func (s *MemoryStore) RecordAutoTopupEvent(ev *AutoTopupEvent) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.autoTopupEventID++
+	stored := *ev
+	stored.ID = s.autoTopupEventID
+	if stored.Status == "" {
+		stored.Status = AutoTopupPending
+	}
+	if stored.CreatedAt.IsZero() {
+		stored.CreatedAt = time.Now()
+	}
+	s.autoTopupEvents[ev.AccountID] = append(s.autoTopupEvents[ev.AccountID], &stored)
+	return stored.ID, nil
+}
+
+// UpdateAutoTopupEvent updates the terminal status of an attempt.
+func (s *MemoryStore) UpdateAutoTopupEvent(id int64, status, externalID, failureReason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, events := range s.autoTopupEvents {
+		for _, e := range events {
+			if e.ID == id {
+				e.Status = status
+				e.ExternalID = externalID
+				e.FailureReason = failureReason
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("auto top-up event %d not found", id)
+}
+
+// AutoTopupChargedSince sums non-failed auto top-up amounts since the given time.
+func (s *MemoryStore) AutoTopupChargedSince(accountID string, since time.Time) (int64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var sum int64
+	for _, e := range s.autoTopupEvents[accountID] {
+		if e.Status != AutoTopupFailed && !e.CreatedAt.Before(since) {
+			sum += e.AmountMicroUSD
+		}
+	}
+	return sum, nil
+}
+
+// LastAutoTopupEvent returns the most recent attempt for an account.
+func (s *MemoryStore) LastAutoTopupEvent(accountID string) (*AutoTopupEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	events := s.autoTopupEvents[accountID]
+	if len(events) == 0 {
+		return nil, nil
+	}
+	copy := *events[len(events)-1]
 	return &copy, nil
 }
 

@@ -341,6 +341,110 @@ export function computeStripeFeeUsd(amountUsd: number, method: "standard" | "ins
   return Math.max(pctMicro, minMicro) / 1_000_000;
 }
 
+// --- Auto Top-Up (Stripe saved card) ---
+//
+// All Auto Top-Up endpoints require a Privy session — no API-key access. The
+// proxy routes fall back to the privy-token cookie when no Authorization
+// header is present, so the browser-side fetch needs no extra plumbing.
+//
+// All money fields are micro-USD (1_000_000 = $1).
+
+export interface AutoTopUpConfig {
+  enabled: boolean;
+  threshold_micro_usd: number;
+  amount_micro_usd: number;
+  payment_method: "stripe";
+  max_per_24h_micro_usd: number;
+  max_single_micro_usd: number;
+  cooldown_seconds: number;
+  notify_webhook_url: string;
+  has_saved_card: boolean;
+  card_brand: string;
+  card_last4: string;
+}
+
+export interface AutoTopUpUpdate {
+  enabled: boolean;
+  payment_method: "stripe";
+  threshold_micro_usd?: number;
+  amount_micro_usd?: number;
+  max_per_24h_micro_usd?: number;
+  max_single_micro_usd?: number;
+  cooldown_seconds?: number;
+  notify_webhook_url?: string;
+}
+
+export interface AutoTopUpSetupIntent {
+  setup_intent_id: string;
+  client_secret: string;
+  customer_id: string;
+}
+
+// extractApiError pulls a human-readable message out of a proxy error
+// response. The proxy routes wrap the upstream body as { error: text }, where
+// text is usually the upstream JSON ({ error: { type, message } }) serialized
+// as a string. We unwrap both layers so the UI can surface the real message.
+function parseErrorString(err: string): string | null {
+  // The proxy forwarded the upstream body verbatim — try to parse it as the
+  // structured { error: { message } } error shape, else use the raw string.
+  try {
+    const parsed = JSON.parse(err);
+    if (parsed?.error?.message) return String(parsed.error.message);
+  } catch {
+    // Not JSON — fall through to the raw string.
+  }
+  return err.trim() ? err : null;
+}
+
+async function extractApiError(res: Response, fallback: string): Promise<string> {
+  const data = await res.json().catch(() => null);
+  const err = (data && typeof data === "object" && "error" in data)
+    ? (data as { error: unknown }).error
+    : null;
+  if (typeof err === "object" && err !== null && "message" in err) {
+    return String((err as { message: unknown }).message);
+  }
+  if (typeof err === "string") {
+    return parseErrorString(err) ?? fallback;
+  }
+  return fallback;
+}
+
+export async function fetchAutoTopUp(): Promise<AutoTopUpConfig> {
+  const res = await fetch("/api/payments/auto-topup", { headers: proxyHeaders() });
+  if (!res.ok) throw new Error(await extractApiError(res, `Failed to fetch auto top-up settings (${res.status})`));
+  return res.json();
+}
+
+export async function updateAutoTopUp(update: AutoTopUpUpdate): Promise<AutoTopUpConfig> {
+  const res = await fetch("/api/payments/auto-topup", {
+    method: "PUT",
+    headers: proxyHeaders(),
+    body: JSON.stringify(update),
+  });
+  if (!res.ok) throw new Error(await extractApiError(res, `Failed to save auto top-up settings (${res.status})`));
+  return res.json();
+}
+
+export async function createAutoTopUpSetupIntent(): Promise<AutoTopUpSetupIntent> {
+  const res = await fetch("/api/payments/auto-topup/setup-intent", {
+    method: "POST",
+    headers: proxyHeaders(),
+  });
+  if (!res.ok) throw new Error(await extractApiError(res, `Failed to start card setup (${res.status})`));
+  return res.json();
+}
+
+export async function confirmAutoTopUpCard(setupIntentId: string): Promise<AutoTopUpConfig> {
+  const res = await fetch("/api/payments/auto-topup/confirm", {
+    method: "POST",
+    headers: proxyHeaders(),
+    body: JSON.stringify({ setup_intent_id: setupIntentId }),
+  });
+  if (!res.ok) throw new Error(await extractApiError(res, `Failed to confirm card (${res.status})`));
+  return res.json();
+}
+
 export async function healthCheck(): Promise<{ status: string; providers: number }> {
   const res = await fetch("/api/health", { headers: proxyHeaders() });
   if (!res.ok) throw new Error(`Health check failed: ${res.status}`);

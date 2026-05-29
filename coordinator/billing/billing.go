@@ -34,6 +34,7 @@ type Service struct {
 	stripe        *StripeProcessor
 	stripeConnect *StripeConnect
 	referral      *ReferralService
+	autoTopup     *AutoTopupManager
 }
 
 // NewService creates a new billing service from the given configuration.
@@ -78,8 +79,19 @@ func NewService(st store.Store, ledger *payments.Ledger, logger *slog.Logger, cf
 		logger.Info("billing: Stripe Connect mock-mode enabled")
 	}
 
+	// Auto top-up rides on the inbound Stripe processor. It is inert (its
+	// Available() reports false) when Stripe is not configured.
+	svc.autoTopup = NewAutoTopupManager(st, svc.stripe, logger)
+	if svc.stripe != nil {
+		logger.Info("billing: auto top-up enabled")
+	}
+
 	return svc
 }
+
+// AutoTopup returns the auto top-up manager (never nil; inert when Stripe is
+// not configured).
+func (s *Service) AutoTopup() *AutoTopupManager { return s.autoTopup }
 
 // Stripe returns the Stripe processor, or nil if not configured.
 func (s *Service) Stripe() *StripeProcessor { return s.stripe }
